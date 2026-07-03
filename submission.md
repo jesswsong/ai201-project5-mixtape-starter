@@ -268,4 +268,59 @@ failures are the two pre-existing playlist-ordering failures (Bug 5), unrelated 
 feed. `get_activity_feed()` is untouched — it deliberately does not use
 `RECENT_THRESHOLD`, so the "full history" feed still behaves as before.
 
+## Bug 5 — "The last song in a playlist never shows up" (`playlist_service.py`)
+
+**How I reproduced it.**
+Two existing tests in `tests/test_playlists.py` pin this down, so I ran them first to
+confirm red. `seed_playlist` builds a playlist with 5 songs (Track 1–5) at explicit
+positions 1–5. `test_playlist_returns_all_songs` asserts `get_playlist_songs()`
+returns 5 songs; `test_playlist_returns_songs_in_order` asserts the titles are
+`["Track 1", ..., "Track 5"]`. Both failed against the original code — the call
+returned only 4 songs (Track 1–4), dropping Track 5:
+
+```
+2 failed, 1 passed
+E  Right contains one more item: 'Track 5'
+```
+
+The third test (`test_empty_playlist_returns_empty_list`) passed even with the bug,
+which was a useful clue about *where* the truncation was.
+
+**How I found the root cause.**
+Navigation path: `GET /playlists/<id>/songs` in `routes/playlists.py` →
+`get_playlist_songs()` in `services/playlist_service.py`. The function's query is
+correct — it joins through `playlist_entries` and orders by `position` ascending, so
+`songs` is the full, correctly-ordered list. The bug had to be after the query, in
+how the result was returned. The return line was:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+The `[:-1]` slice was the moment of confidence: it's a list slice that excludes the
+last element. That also explains why the empty-playlist test still passed — `[][:-1]`
+is `[]`, so the truncation is invisible when there are no songs, and only shows up
+once the playlist has at least one entry (where it silently drops the final one).
+
+**The root cause.**
+The list comprehension iterated over `songs[:-1]` instead of `songs`. `[:-1]` returns
+every element *except the last*, so the highest-position song in every non-empty
+playlist was discarded before serialization. The database query returned all songs
+correctly; the truncation happened purely in the return statement. The function's own
+docstring ("returns all songs in the playlist") contradicted the slice.
+
+**My fix and side-effect check.**
+I changed `songs[:-1]` to `songs` so the comprehension serializes the complete
+ordered list:
+
+```python
+return [song.to_dict() for song in songs]
+```
+
+Both previously-failing playlist tests now pass (5 songs returned, correct Track 1–5
+order), and the empty-playlist test still passes (an empty list is unaffected). I ran
+the **full** suite afterwards: **13 passed**, 0 failed — this was the last outstanding
+failure, so all three bug areas (streak, feed, playlist) are now green together with
+no regressions.
+
 
