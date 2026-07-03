@@ -163,18 +163,59 @@ one endpoint with a side effect on a different table.)*
 
 ---
 
-## Discrepancies worth a closer look
+# Root Cause Analysis
 
-While reading, I found three places where the code contradicts its own docstring —
-noting them here since they're likely relevant to the bugfix part of the project:
+## Bug 1 — "My listening streak keeps resetting" (`streak_service.py`)
 
-- **`playlist_service.get_playlist_songs()`** returns `songs[:-1]` — it drops the
-  **last** song, even though the docstring says "returns all songs in the playlist."
-- **`streak_service.update_listening_streak()`** only increments when
-  `days_since_last == 1 and today.weekday() != 6` — i.e. a streak **never advances
-  on a Sunday**, which the "increments on consecutive calendar days" docstring
-  doesn't mention.
-- **`notification_service.rate_song()`** saves the `Rating` but **never creates a
-  notification**, even though the module docstring says "Notifications are generated
-  when friends interact with a user's shared songs." Only `add_to_playlist()`
-  actually notifies.
+**How I reproduced it.**
+The symptom is date-dependent, so I reproduced it with a fixed-date scenario rather
+than waiting for a real calendar day. The reproducing sequence: a user listens on a
+Saturday (streak becomes 1), then listens again the very next day, Sunday. Expected
+result is a streak of 2 (two consecutive days); the actual result was 1 — the streak
+reset even though no day was skipped. This is exactly what the existing test
+`test_streak_increments_on_sunday` in `tests/test_streaks.py` pins down: it feeds
+`2024-06-15` (Saturday) then `2024-06-16` (Sunday) into `update_listening_streak()`
+and asserts the streak is 2. Against the original code that assertion fails; the bug
+only surfaced when the *second* listen landed on a Sunday, which is why it looked
+intermittent ("keeps resetting" ≈ resets every Sunday).
+
+**How I found the root cause.**
+I started from the endpoint the streak lives behind — `POST /songs/<id>/listen` in
+`routes/songs.py` → `record_listening_event()` → `update_listening_streak()` in
+`services/streak_service.py`. All the streak arithmetic is in that one function, so I
+read its branch logic. The three branches key off `days_since_last` (0 = same day, 1
+= consecutive, else = gap). The moment of confidence was reading the consecutive-day
+branch and seeing a second, unrelated condition bolted onto it:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+else:
+    user.listening_streak = 1
+```
+
+The `days_since_last == 1` part is the correct "consecutive day" test. The
+`and today.weekday() != 6` had nothing to do with consecutiveness — and 6 is exactly
+the value that made the Sunday test fail. That pinned it to the specific line, not
+just "somewhere in the streak logic."
+
+**The root cause.**
+Python's `date.weekday()` returns `6` for Sunday. The consecutive-day branch required
+`today.weekday() != 6`, so whenever the current listen fell on a Sunday, the branch
+condition evaluated to `True and False → False`, control fell through to the `else`,
+and the streak was reset to 1 — *even though the user had listened the day before and
+the streak should have incremented*. The gap-detection logic (`days_since_last`) was
+correct on its own; the extra weekday clause was an unrelated condition that corrupted
+a valid consecutive-day case one day out of every seven.
+
+**My fix and side-effect check.**
+I removed the `and today.weekday() != 6` clause so the branch reads
+`elif days_since_last == 1:` — the streak now increments purely on the basis of
+consecutive calendar days, which is the documented rule. I re-ran the full streak
+suite (`tests/test_streaks.py`) to confirm the neighbouring behaviours still hold:
+new-user start-at-1, increment on a normal consecutive day, no double-count on two
+listens the same day, and reset after a genuinely skipped day all still pass (5/5).
+Because the removed clause only ever *forced a reset*, deleting it cannot cause a
+missed reset — the real reset path (`else`, for `days_since_last > 1`) is untouched.
+
+
