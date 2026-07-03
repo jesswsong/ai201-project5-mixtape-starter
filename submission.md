@@ -218,4 +218,54 @@ listens the same day, and reset after a genuinely skipped day all still pass (5/
 Because the removed clause only ever *forced a reset*, deleting it cannot cause a
 missed reset — the real reset path (`else`, for `days_since_last > 1`) is untouched.
 
+## Bug 2 — "Friends Listening Now shows people from yesterday" (`feed_service.py`)
+
+**How I reproduced it.**
+There's no test for the feed, so I wrote a small reproduction script against an
+in-memory database. It creates a user and a friend, makes them friends, and inserts a
+single `ListeningEvent` for the friend timestamped **20 hours ago** (i.e. yesterday,
+but within the last day). Then it calls `get_friends_listening_now(me.id)`. Expected
+behaviour for a "listening *now*" feed is an empty result — the friend isn't
+currently listening, they listened yesterday. Actual result: the feed returned that
+friend, confirming stale listens leak into "now."
+
+```
+[A] only yesterday's listen -> feed size = 1   (BUG)
+```
+
+**How I found the root cause.**
+Navigation path: `GET /feed/<id>/listening-now` in `routes/feed.py` →
+`get_friends_listening_now()` in `services/feed_service.py`. Reading that function,
+the query itself is correct — it filters `ListeningEvent.listened_at >= cutoff` where
+`cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`, which correctly keeps events
+*newer* than the cutoff. So the direction of the comparison was fine; the only other
+input to the cutoff is the window size. Looking up the module-level constant made it
+obvious:
+
+```python
+RECENT_THRESHOLD = timedelta(hours=24)
+```
+
+That was the moment of confidence: a 24-hour window is by definition "anything since
+this time yesterday," which is exactly the reported symptom, and it's the single value
+that defines what "now" means for this feed.
+
+**The root cause.**
+The "recent" window was set to 24 hours. `get_friends_listening_now()` treats any
+friend with a listen in the last 24 hours as "listening now," so a listen from
+yesterday afternoon still qualifies well into today. The feed was never meant to be a
+day-long history (that's what `get_activity_feed()` is for, further down the same
+file); it's supposed to show who is *currently* playing something. The window size,
+not the query logic, was wrong.
+
+**My fix and side-effect check.**
+I changed the constant to `RECENT_THRESHOLD = timedelta(minutes=15)`, a window that
+actually corresponds to "right now." I re-ran the reproduction script to check both
+directions: a 20-hour-old (yesterday) listen is now excluded (feed size 0), and a
+genuinely recent 5-minute-old listen still appears (feed size 1) — so the fix isn't
+over-corrected. I also ran the full test suite: the same 11 tests pass and the only
+failures are the two pre-existing playlist-ordering failures (Bug 5), unrelated to the
+feed. `get_activity_feed()` is untouched — it deliberately does not use
+`RECENT_THRESHOLD`, so the "full history" feed still behaves as before.
+
 
