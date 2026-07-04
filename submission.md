@@ -4,6 +4,64 @@ Mixtape is a small Flask + SQLAlchemy backend for a music-sharing app. Users sha
 songs, add them to (collaborative) playlists, rate them, "listen" to them (which
 builds a daily streak), and see a feed of what their friends are playing.
 
+---
+
+## How I used AI on this project
+
+I used an AI assistant (Claude) as a pair-programming partner throughout this
+project, but I drove the understanding of each bug myself before we changed any
+code. My general loop was: ask the AI to explain a part of the system, form my own
+hypothesis about what was wrong, then confirm it against the actual code and a real
+run before fixing.
+
+**Understanding the codebase first.** Before touching any bugs, I asked the AI to
+help me build a mental model of how the app is wired together. It produced the
+layered diagram and the routes-to-services mapping in this doc. Once I understood that routes just delegate to services and all
+the real logic lives in `services/`, I knew that every bug would live in a service
+function, which is exactly where they turned out to be.
+
+**Working each bug together.** For each of the five bugs I had the AI trace the path
+from the endpoint down to the responsible service function, then I read the flagged
+function myself to confirm the specific line before we fixed it. Some concrete
+examples of what I asked it to explain or trace:
+- *Streak (Bug 1):* it traced `POST /songs/<id>/listen` → `record_listening_event()`
+  → `update_listening_streak()` and pointed at the `today.weekday() != 6` clause. I
+  confirmed for myself that `weekday()` returns 6 for Sunday, which is what made the
+  behaviour "reset every Sunday" rather than randomly.
+- *Notification asymmetry (Bug 4):* I asked it to compare `rate_song()` against
+  `add_to_playlist()` side by side, which made the missing `create_notification()`
+  call obvious. We then mirrored the existing playlist pattern for the fix.
+- *Playlist (Bug 5):* the two failing tests already pointed here; the AI confirmed the
+  `songs[:-1]` slice was dropping the last element and I checked that the empty-list
+  case (`[][:-1]`) explained why one of the three tests still passed.
+
+**Where I had to verify things myself / the AI was incomplete or wrong.** This is the
+part I learned the most from:
+- *The search bug (Bug 3) did not reproduce the way the AI predicted.* The AI
+  confidently said the `outerjoin(song_tags)` would return the same song multiple
+  times, but when I ran the search tests they all **passed**. Rather than trust the
+  explanation, I ran the query directly and found that the raw SQL join really does
+  produce 3 rows for a 3-tag song, but **SQLAlchemy 2.0.50 deduplicates single-entity
+  results by primary key**, so the duplication never reached the caller in this
+  environment. The AI's root cause (pointless join) was right, but its claim that the
+  bug was *currently visible* was wrong — the bug was latent and version-dependent. I
+  only learned that by checking instead of taking the explanation at face value.
+- *The AI's initial "all five bugs reproduce" summary was partly stale.* When we
+  started on the streak bug, the AI expected the Sunday test to fail, but it passed —
+  because that fix had already been committed earlier. I had to check `git log`/`git
+  diff` to see the true state of the tree rather than rely on the AI's assumption.
+- *A number in the AI-written notes didn't match the committed code.* The draft RCA
+  said the feed window was changed to 15 minutes, but the value actually committed was
+  10 minutes. I caught this by diffing the doc against the real source and corrected
+  it. Takeaway: AI-generated prose can drift from the actual code, so every concrete
+  value and claim in this doc was checked against a run or the committed source.
+
+Every fix in this submission was confirmed with the test suite (`pytest`) or a
+targeted reproduction script that I ran and read the output of — I did not accept a
+fix as "done" on the AI's word alone.
+
+---
+
 The code is organized in **four layers**, and every request flows through them
 top-to-bottom:
 
