@@ -259,13 +259,12 @@ file); it's supposed to show who is *currently* playing something. The window si
 not the query logic, was wrong.
 
 **My fix and side-effect check.**
-I changed the constant to `RECENT_THRESHOLD = timedelta(minutes=15)`, a window that
+I changed the constant to `RECENT_THRESHOLD = timedelta(minutes=10)`, a window that
 actually corresponds to "right now." I re-ran the reproduction script to check both
 directions: a 20-hour-old (yesterday) listen is now excluded (feed size 0), and a
 genuinely recent 5-minute-old listen still appears (feed size 1) — so the fix isn't
-over-corrected. I also ran the full test suite: the same 11 tests pass and the only
-failures are the two pre-existing playlist-ordering failures (Bug 5), unrelated to the
-feed. `get_activity_feed()` is untouched — it deliberately does not use
+over-corrected. I also ran the full test suite; the feed change introduced no new
+failures. `get_activity_feed()` is untouched — it deliberately does not use
 `RECENT_THRESHOLD`, so the "full history" feed still behaves as before.
 
 ## Bug 5 — "The last song in a playlist never shows up" (`playlist_service.py`)
@@ -322,5 +321,117 @@ order), and the empty-playlist test still passes (an empty list is unaffected). 
 the **full** suite afterwards: **13 passed**, 0 failed — this was the last outstanding
 failure, so all three bug areas (streak, feed, playlist) are now green together with
 no regressions.
+
+## Bug 3 — "The same song keeps showing up twice in search" (`search_service.py`)
+
+**How I reproduced it — and an important caveat.**
+`tests/test_search.py` is built to expose this: `seed_songs` creates a song with
+three tags ("Crown Heights Anthem") and the test
+`test_search_no_duplicates_multi_tag_song` searches for it and asserts it appears
+exactly once, with the comment "bug causes it to be 3." I ran the search suite first
+to confirm — but **all five tests passed against the original code**. So I could not
+reproduce the *visible* duplicate in this environment, and I stopped to find out why
+before assuming the test was wrong.
+
+The environment runs **SQLAlchemy 2.0.50**, whose ORM deduplicates single-entity
+results by primary key. I proved the mechanism directly: running the exact join the
+buggy code used against a 3-tag song returned **3 rows at the raw-SQL level** but only
+**1 object** from `db.session.query(Song)...all()`:
+
+```
+Raw SQL join rows (DB level):     3
+ORM query(Song).all() objects:    1
+```
+
+So the duplication is **latent** — the query really does fan out, but the installed
+ORM version collapses the duplicate `Song` objects by identity before they reach the
+caller. On an older SQLAlchemy, or if the query selected columns from the joined
+table instead of whole entities, the same code would return the song three times,
+exactly as the test comment predicts.
+
+**How I found the root cause.**
+Navigation path: `GET /songs/search` in `routes/songs.py` → `search_songs()` in
+`services/search_service.py`. Reading the query, one clause stood out as the source
+of the fan-out:
+
+```python
+db.session.query(Song)
+  .outerjoin(song_tags, Song.id == song_tags.c.song_id)   # <-- fans out
+  .filter(db.or_(Song.title.ilike(...), Song.artist.ilike(...)))
+```
+
+The confidence moment was realizing the join is not just the cause of the duplication
+but is **entirely pointless**: `song_tags` appears nowhere in the `WHERE` clause (the
+filter only touches `title`/`artist`) and nowhere in the `SELECT` (tags are loaded
+separately via the `Song.tags` relationship inside `to_dict()`). It contributes
+nothing except one output row per tag — a textbook unintended cartesian-style
+fan-out.
+
+**The root cause.**
+`search_songs()` performed an `outerjoin` against the `song_tags` association table
+that served no functional purpose. A song with N tags matches N rows of that join, so
+the result set contained one copy of the song per tag (three copies for a 3-tag
+song). The correctness of the visible output was accidentally being propped up by
+SQLAlchemy 2.0's entity uniquing; the query itself was wrong.
+
+**My fix and side-effect check.**
+I removed the `.outerjoin(song_tags, ...)` line so the query filters `Song` directly
+with no join, and dropped the now-unused `Tag, song_tags` import. I confirmed via the
+compiled SQL that the statement is now a plain `SELECT ... FROM song WHERE ...` with
+no join, so it can no longer fan out **regardless of ORM version** — the fix removes
+the reliance on entity-uniquing rather than papering over it with `.distinct()`. Tags
+still appear in each result because `to_dict()` reads them from the relationship,
+which I verified is untouched. The full suite passes (**13 passed, 0 failed**),
+including `test_search_returns_matching_songs` (tags still present) and all four
+no-duplicate cases.
+
+## Bug 4 — "Notified when a friend added my song to a playlist, but not when they rated it" (`notification_service.py`)
+
+**How I reproduced it.**
+There's no test for the notification side effect, so I wrote a script against an
+in-memory database: a `sharer` shares a song, then a different user (`rater`) rates it
+5/5 via `rate_song()`. Expected: the sharer gets one notification ("someone
+interacted with your song"), the same way adding the song to a playlist notifies them.
+Actual: zero notifications were created for the sharer:
+
+```
+Notifications for sharer after a friend rated their song: 0   (BUG)
+```
+
+**How I found the root cause.**
+The report itself names the asymmetry — one interaction notifies, a sibling
+interaction doesn't — so I opened `services/notification_service.py` and compared the
+two functions side by side. `add_to_playlist()` ends with an explicit notify block:
+
+```python
+if song.shared_by != added_by_user_id:
+    create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", body=...)
+```
+
+`rate_song()`, right below it, does all the same setup — loads the `song` and the
+`rater`, saves the `Rating`, commits — and then simply `return rating`. The moment of
+confidence was seeing that `rate_song()` has the exact ingredients the notify block
+needs (`song.shared_by`, `rater.username`, `song.title`) already in local scope but
+never calls `create_notification()` at all. It wasn't a wrong condition; the call was
+absent.
+
+**The root cause.**
+`rate_song()` was missing the notification step entirely. It correctly created/updated
+the `Rating` and returned it, but never told the song's original sharer that their
+song had been rated. The module docstring ("Notifications are generated when friends
+interact with a user's shared songs") describes the intended behaviour, and
+`add_to_playlist()` implements it, but the rating path was never wired up to it.
+
+**My fix and side-effect check.**
+I added a notify block to `rate_song()` after the commit, mirroring
+`add_to_playlist()` exactly: if `song.shared_by != user_id`, call
+`create_notification(user_id=song.shared_by, notification_type="song_rated",
+body=f"{rater.username} rated your song '{song.title}' {score}/5.")`. The
+`shared_by != user_id` guard means users don't get notified for rating their own
+songs — I verified both directions in the reproduction script: a friend's rating
+produces exactly one `song_rated` notification, and the sharer rating their own song
+produces none (count stays at 1). I placed the call after `db.session.commit()` so the
+rating is persisted first, consistent with the playlist flow. Full suite: **13 passed,
+0 failed** — no existing behaviour regressed.
 
 
