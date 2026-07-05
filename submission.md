@@ -221,6 +221,7 @@ one endpoint with a side effect on a different table.)*
 
 ---
 
+<<<<<<< Updated upstream
 # Root Cause Analysis
 
 ## Bug 1 — "My listening streak keeps resetting" (`streak_service.py`)
@@ -493,3 +494,209 @@ rating is persisted first, consistent with the playlist flow. Full suite: **13 p
 0 failed** — no existing behaviour regressed.
 
 
+=======
+## Bugs fixed — summary
+
+| # | Symptom | File | One-line cause | Fix |
+|---|---------|------|----------------|-----|
+| 1 | Listening streak keeps resetting | `streak_service.py` | Extra `and today.weekday() != 6` clause forced a reset every Sunday | Delete the clause |
+| 2 | "Friends Listening Now" shows people from yesterday | `feed_service.py` | "Recent" window was 24h, so yesterday still counts as "now" | Shrink `RECENT_THRESHOLD` to 10 min |
+| 3 | Same song shows up twice in search | `search_service.py` | Pointless `outerjoin(song_tags)` fans out one row per tag | Remove the join |
+| 4 | Notified on playlist-add but not on rating | `notification_service.py` | `rate_song()` never called `create_notification()` | Add the notify block |
+| 5 | Last song in a playlist never shows | `playlist_service.py` | Return statement sliced `songs[:-1]` | Return the full list |
+
+---
+
+# Root Cause Analysis
+
+Each entry below records how I reproduced the bug, how I located the exact cause,
+what the cause was, **why the fix actually resolves it**, and **what else I verified**
+so the change is provably safe. All fixes were confirmed with `pytest` (13 tests) or a
+targeted reproduction script whose output I read directly.
+
+## Bug 1 — "My listening streak keeps resetting" (`streak_service.py`)
+
+**How I reproduced it.** The symptom is date-dependent, so I reproduced it with fixed
+dates instead of waiting for a real Sunday. Sequence: a user listens on Saturday
+(streak → 1), then listens the very next day, Sunday. Expected streak = 2 (two
+consecutive days); actual = 1. This is exactly what `test_streak_increments_on_sunday`
+in `tests/test_streaks.py` encodes — it feeds `2024-06-15` (Sat) then `2024-06-16`
+(Sun) into `update_listening_streak()` and asserts `2`. Against the original code that
+assertion fails, which explains the "keeps resetting" report: the streak silently died
+every Sunday.
+
+**How I found the root cause.** I traced the path `POST /songs/<id>/listen`
+(`routes/songs.py`) → `record_listening_event()` → `update_listening_streak()`. All the
+arithmetic is in that one function, keyed off `days_since_last` (0 = same day, 1 =
+consecutive, else = gap). Reading the consecutive-day branch, I saw a second, unrelated
+condition welded onto it: `elif days_since_last == 1 and today.weekday() != 6:`.
+
+**The root cause.** Python's `date.weekday()` returns `6` for Sunday. When the listen
+fell on a Sunday, the branch evaluated `True and False → False`, control dropped to the
+`else`, and the streak reset to 1 — even though the user *had* listened the day before.
+The consecutiveness test itself was correct; the `weekday() != 6` term was spurious.
+
+**The fix and why it works.** I removed the clause so the branch reads
+`elif days_since_last == 1:`. This works because the three branches partition on
+elapsed days: `== 0` holds, `== 1` increments, everything else resets. The bug was an
+extra term that could turn a legitimate `== 1` case into the reset path one day a week;
+removing it makes "consecutive day" the *only* thing that decides an increment, which
+is the documented rule. Crucially, the term I deleted could only ever *force a reset*,
+so removing it cannot introduce a *missed* reset — the genuine reset path (`else`, for
+`days_since_last > 1`) is untouched.
+
+**What else I verified.** I re-ran the full `tests/test_streaks.py` suite (5 tests) and
+confirmed every neighbouring behaviour still holds: new user starts at 1, a normal
+consecutive weekday still increments, two listens the same day don't double-count, and
+a genuinely skipped day still resets to 1. That last one is the important safety check
+— it proves I fixed the Sunday case without weakening real gap detection. Full project
+suite stayed green (13/13).
+
+## Bug 2 — "Friends Listening Now shows people from yesterday" (`feed_service.py`)
+
+**How I reproduced it.** There's no feed test, so I wrote a script on an in-memory DB:
+a user and a friend who are friends, and a single `ListeningEvent` for the friend
+timestamped **20 hours ago** (yesterday, but within a day). Calling
+`get_friends_listening_now(me.id)` returned that friend — a "listening now" feed
+surfacing someone who last listened yesterday afternoon.
+
+**How I found the root cause.** Path: `GET /feed/<id>/listening-now` (`routes/feed.py`)
+→ `get_friends_listening_now()`. The query filters `ListeningEvent.listened_at >=
+cutoff` where `cutoff = now - RECENT_THRESHOLD`, which correctly keeps events *newer*
+than the cutoff — so the comparison direction was fine and the only remaining input was
+the window size: `RECENT_THRESHOLD = timedelta(hours=24)`.
+
+**The root cause.** The "recent" window was a full 24 hours, so anyone who listened any
+time since this hour yesterday qualified as "listening now." The feed was never meant
+to be a day-long history — that role belongs to `get_activity_feed()` further down the
+file — it's meant to show who is *currently* playing something.
+
+**The fix and why it works.** I set `RECENT_THRESHOLD = timedelta(minutes=10)`. This
+works precisely *because* the query was already correct: `cutoff = now - 10min` means
+the same `listened_at >= cutoff` filter now admits only events from the last ten
+minutes, and a listen from 20 hours ago is far below that cutoff and is excluded. I
+changed the constant that *defines* "recent," not the query — the minimal change that
+fixes the reported behaviour.
+
+**What else I verified.** I re-ran the script in both directions to make sure I hadn't
+over-corrected: a 20-hour-old (yesterday) listen is now excluded (feed size 0), and a
+genuinely recent 5-minute-old listen still appears (feed size 1). I confirmed
+`get_activity_feed()` is untouched and deliberately does *not* use `RECENT_THRESHOLD`,
+so the "full history" feed and the "now" feed stay semantically distinct — narrowing
+one didn't silently narrow the other. The per-friend dedup logic still returns one
+entry per friend. Full suite: no new failures.
+
+## Bug 3 — "The same song keeps showing up twice in search" (`search_service.py`)
+
+**How I reproduced it — and a caveat.** `tests/test_search.py` builds a song with three
+tags and asserts it appears once. I ran the suite first to confirm the bug, but **all
+five tests passed**. Rather than assume the test was wrong, I ran the query directly:
+the raw SQL join returns **3 rows** for the 3-tag song, but `db.session.query(Song).all()`
+returns **1 object**. The installed **SQLAlchemy 2.0.50** deduplicates single-entity
+results by primary key, so the duplication never reaches the caller *in this
+environment*. The bug is real but **latent** — on an older SQLAlchemy, or if the query
+selected columns from the joined table, the song would come back three times.
+
+**How I found the root cause.** Path: `GET /songs/search` (`routes/songs.py`) →
+`search_songs()`. The query does `db.session.query(Song).outerjoin(song_tags, ...)`
+then filters on title/artist. The join stood out as both the fan-out source and
+entirely pointless: `song_tags` appears in neither the `WHERE` (which only touches
+`title`/`artist`) nor the `SELECT` (tags are loaded separately via the `Song.tags`
+relationship inside `to_dict()`).
+
+**The root cause.** An `outerjoin` against the `song_tags` association table that served
+no functional purpose. A song with N tags matches N join rows, producing one copy per
+tag. The visible output was accidentally being propped up by SQLAlchemy's entity
+uniquing; the query itself was wrong.
+
+**The fix and why it works.** I removed the `.outerjoin(song_tags, ...)` line (and the
+now-unused `Tag, song_tags` import). This works by construction: with no join the
+statement is `SELECT ... FROM song WHERE title/artist LIKE ...`, which yields exactly
+one row per matching song — so duplicates are impossible **regardless of ORM version**.
+I deliberately chose to remove the join rather than paper over it with `.distinct()`,
+because `.distinct()` would only mask the fan-out while still relying on the DB to
+collapse rows; removing the cause is the robust fix.
+
+**What else I verified.** I inspected the compiled SQL to confirm the `JOIN` is gone. I
+re-ran `tests/test_search.py` (5 tests): the "matching songs" test confirms tags still
+appear in each result (proving `to_dict()`'s relationship load is unaffected by
+dropping the join), and all four no-duplicate cases pass. I kept the before/after
+raw-SQL-vs-ORM measurement (3 rows → 1 row, now 1 row → 1 row) as evidence of the
+mechanism. Full suite: 13/13.
+
+## Bug 4 — "Notified when a friend added my song to a playlist, but not when they rated it" (`notification_service.py`)
+
+**How I reproduced it.** No test covers the notification side effect, so I scripted it:
+a `sharer` shares a song, a different `rater` rates it 5/5 via `rate_song()`. Expected:
+the sharer gets one notification, the same way a playlist-add notifies them. Actual:
+zero notifications were created for the sharer.
+
+**How I found the root cause.** The report names the asymmetry directly, so I compared
+the two sibling functions in `notification_service.py` side by side.
+`add_to_playlist()` ends with an explicit notify block guarded by
+`song.shared_by != added_by_user_id`. `rate_song()` right below it does all the same
+setup — loads the `song` and `rater`, saves the `Rating`, commits — then simply
+`return rating`. It had every ingredient the notify block needs (`song.shared_by`,
+`rater.username`, `song.title`) already in local scope but never called
+`create_notification()`.
+
+**The root cause.** `rate_song()` was missing the notification step entirely. It
+persisted the rating correctly but never told the song's sharer, even though the module
+docstring promises "notifications are generated when friends interact with a user's
+shared songs" and `add_to_playlist()` implements exactly that.
+
+**The fix and why it works.** I added a notify block after the commit, mirroring
+`add_to_playlist()`: if `song.shared_by != user_id`, call
+`create_notification(user_id=song.shared_by, notification_type="song_rated",
+body=f"{rater.username} rated your song '{song.title}' {score}/5.")`. This works
+because it reuses the exact mechanism the working playlist path already uses —
+`create_notification()` inserts a `Notification` row addressed to the sharer — so the
+two interactions become symmetric. The `shared_by != user_id` guard reproduces the
+playlist function's rule that you aren't notified about your own actions, and placing
+the call *after* `db.session.commit()` means the `Rating` is durably saved before the
+notification is created, matching the ordering in the playlist flow.
+
+**What else I verified.** I ran the script in both directions: a friend's rating now
+produces exactly one `song_rated` notification with the correct body, and the sharer
+rating their *own* song produces none (the guard holds, count stays put). I also
+reasoned about the re-rating path — `rate_song()` updates an existing `Rating` under the
+`UniqueConstraint(user_id, song_id)`; the notify block sits after that branch, so both
+first-time and repeat ratings notify. Full suite: 13/13, so the existing
+`add_to_playlist()` notification and the rating-persistence behaviour both still work.
+
+## Bug 5 — "The last song in a playlist never shows up" (`playlist_service.py`)
+
+**How I reproduced it.** Two existing tests in `tests/test_playlists.py` pin this down,
+so I ran them first to confirm red. `seed_playlist` builds a 5-song playlist
+(Track 1–5) at positions 1–5. `test_playlist_returns_all_songs` asserts 5 songs come
+back; `test_playlist_returns_songs_in_order` asserts the titles are Track 1–5. Both
+failed — the call returned only 4 songs, dropping Track 5.
+
+**How I found the root cause.** Path: `GET /playlists/<id>/songs`
+(`routes/playlists.py`) → `get_playlist_songs()`. The query joins through
+`playlist_entries` and orders by `position` ascending, so `songs` is the full,
+correctly-ordered list — the bug had to be after the query. The return line was
+`return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice was the moment of
+confidence, and it also explains why the *third* test
+(`test_empty_playlist_returns_empty_list`) still passed: `[][:-1]` is `[]`, so the
+truncation is invisible for empty playlists and only bites once there's at least one
+song.
+
+**The root cause.** The comprehension iterated over `songs[:-1]` instead of `songs`.
+`[:-1]` returns everything except the last element, so the highest-`position` song in
+every non-empty playlist was discarded before serialization. The database query was
+correct; the truncation happened purely in the return statement, contradicting the
+function's own docstring ("returns all songs in the playlist").
+
+**The fix and why it works.** I changed `songs[:-1]` to `songs`. This works because the
+slice was the *only* thing limiting the result — there is no other `LIMIT`, filter, or
+truncation in the function — so iterating the complete list serializes exactly the rows
+the (already-correct) ordered query returned. The `ORDER BY position` is preserved, so
+songs still come back in playlist order.
+
+**What else I verified.** Both previously-failing tests flip green: 5 songs returned,
+and the exact Track 1–5 order asserted (confirming I preserved ordering, not just
+count). The empty-playlist test still passes, so the change is safe for the zero-song
+case. I ran the **full** suite afterwards — 13 passed, 0 failed — confirming no
+regression anywhere else.
+>>>>>>> Stashed changes
